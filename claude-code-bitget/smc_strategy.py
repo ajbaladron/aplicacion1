@@ -1,22 +1,34 @@
 """
 SMC Strategy Engine — Smart Money Concepts multi-timeframe analysis.
-Supports: BTC-USDT, ETH-USDT, SOL-USDT, XRP-USDT, ADA-USDT, XLM-USDT
+Exchange: Pionex Perpetual Futures
+Simbolos: BTC_USDT, ETH_USDT, SOL_USDT, XRP_USDT, ADA_USDT, XLM_USDT
+          (formato Pionex: guion_bajo, sin guion)
 """
 from __future__ import annotations
 
 import requests
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
-# ── Global symbol (caller must set before calling fetch_candles) ──────────────
-SYMBOL = "BTC-USDT"
+# ── Global symbol — cambiar antes de llamar fetch_candles ─────────────────────
+SYMBOL = "BTC_USDT"
 
-BASE_URL = "https://api.bitget.com"
+BASE_URL = "https://api.pionex.com"
 
+# Pionex granularidades para futuros perpetuos
 _TF_MAP = {
-    "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m",
-    "1h": "1H", "2h": "2H", "4h": "4H", "6h": "6H", "12h": "12H",
-    "1d": "1D", "1w": "1W",
+    "1m":  "1M",
+    "3m":  "3M",
+    "5m":  "5M",
+    "15m": "15M",
+    "30m": "30M",
+    "1h":  "1H",
+    "2h":  "2H",
+    "4h":  "4H",
+    "6h":  "6H",
+    "12h": "12H",
+    "1d":  "1D",
+    "1w":  "1W",
 }
 
 
@@ -36,7 +48,7 @@ class Candle:
 class Swing:
     idx: int
     price: float
-    kind: str   # 'high' or 'low'
+    kind: str   # 'high' o 'low'
 
 
 @dataclass
@@ -44,7 +56,7 @@ class OrderBlock:
     idx: int
     top: float
     bot: float
-    kind: str   # 'bullish' or 'bearish'
+    kind: str        # 'bullish' o 'bearish'
     mitigated: bool = False
 
 
@@ -52,28 +64,39 @@ class OrderBlock:
 class FVG:
     top: float
     bot: float
-    kind: str   # 'bull' or 'bear'
-    idx: int    # index of the gap candle
+    kind: str   # 'bull' o 'bear'
+    idx: int
 
 
 # ── Candle fetch ──────────────────────────────────────────────────────────────
 
 def fetch_candles(timeframe: str, limit: int = 100) -> list[Candle]:
-    tf = _TF_MAP.get(timeframe, timeframe)
-    url = f"{BASE_URL}/api/v2/mix/market/candles"
+    """
+    Obtiene velas del endpoint publico de Pionex.
+    Respuesta esperada:
+      { "result": true, "data": { "klines": [[ts, o, h, l, c, v], ...] } }
+    """
+    tf = _TF_MAP.get(timeframe, timeframe.upper())
+    url = f"{BASE_URL}/api/v1/market/klines"
     params = {
         "symbol": SYMBOL,
-        "granularity": tf,
+        "interval": tf,
         "limit": str(limit),
-        "productType": "USDT-FUTURES",
     }
     r = requests.get(url, params=params, timeout=10)
     data = r.json()
-    candles = []
+
+    rows = []
     if isinstance(data, dict):
-        rows = data.get("data", [])
-    else:
+        inner = data.get("data", {})
+        if isinstance(inner, dict):
+            rows = inner.get("klines", [])
+        elif isinstance(inner, list):
+            rows = inner
+    elif isinstance(data, list):
         rows = data
+
+    candles = []
     for row in rows:
         candles.append(Candle(
             t=int(row[0]),
@@ -108,9 +131,8 @@ def detect_structure(
     candles: list[Candle], swings: list[Swing]
 ) -> tuple[str, Optional[float]]:
     """
-    Returns (trend, choch_level).
-    trend: 'bullish', 'bearish', or 'ranging'
-    choch_level: price of last CHoCH if found, else None
+    Retorna (trend, choch_level).
+    trend: 'bullish', 'bearish' o 'ranging'
     """
     highs = [s for s in swings if s.kind == "high"]
     lows  = [s for s in swings if s.kind == "low"]
@@ -118,7 +140,6 @@ def detect_structure(
     if len(highs) < 2 or len(lows) < 2:
         return "ranging", None
 
-    # Last two highs and lows
     hh = highs[-1].price > highs[-2].price
     hl = lows[-1].price  > lows[-2].price
     lh = highs[-1].price < highs[-2].price
@@ -131,11 +152,10 @@ def detect_structure(
     else:
         trend = "ranging"
 
-    # CHoCH: last swing that broke the previous structure
     choch_level: Optional[float] = None
-    if trend == "bullish" and len(highs) >= 2:
+    if trend == "bullish":
         choch_level = highs[-2].price
-    elif trend == "bearish" and len(lows) >= 2:
+    elif trend == "bearish":
         choch_level = lows[-2].price
 
     return trend, choch_level
@@ -156,32 +176,21 @@ def find_order_blocks(
             continue
 
         if swing.kind == "high" and trend in ("bearish", "ranging"):
-            # Bearish OB: last bullish candle before a swing high
             for j in range(i, max(i - 5, 0), -1):
-                if candles[j].c > candles[j].o:  # bullish candle
-                    ob = OrderBlock(
-                        idx=j,
-                        top=candles[j].h,
-                        bot=candles[j].o,
-                        kind="bearish",
-                    )
-                    obs.append(ob)
+                if candles[j].c > candles[j].o:
+                    obs.append(OrderBlock(
+                        idx=j, top=candles[j].h, bot=candles[j].o, kind="bearish"
+                    ))
                     break
 
         elif swing.kind == "low" and trend in ("bullish", "ranging"):
-            # Bullish OB: last bearish candle before a swing low
             for j in range(i, max(i - 5, 0), -1):
-                if candles[j].c < candles[j].o:  # bearish candle
-                    ob = OrderBlock(
-                        idx=j,
-                        top=candles[j].o,
-                        bot=candles[j].l,
-                        kind="bullish",
-                    )
-                    obs.append(ob)
+                if candles[j].c < candles[j].o:
+                    obs.append(OrderBlock(
+                        idx=j, top=candles[j].o, bot=candles[j].l, kind="bullish"
+                    ))
                     break
 
-    # Mark mitigated OBs (price already traded through them)
     last_price = candles[-1].c
     for ob in obs:
         if ob.kind == "bearish" and last_price > ob.top:
@@ -200,15 +209,12 @@ def find_fvgs(candles: list[Candle], lookback: int = 40) -> list[FVG]:
     start = max(0, n - lookback)
 
     for i in range(start + 1, n - 1):
-        prev  = candles[i - 1]
-        curr  = candles[i]
-        nxt   = candles[i + 1]
+        prev = candles[i - 1]
+        nxt  = candles[i + 1]
 
-        # Bullish FVG: gap between prev.high and next.low (price moved up)
         if nxt.l > prev.h:
             fvgs.append(FVG(top=nxt.l, bot=prev.h, kind="bull", idx=i))
 
-        # Bearish FVG: gap between prev.low and next.high (price moved down)
         if nxt.h < prev.l:
             fvgs.append(FVG(top=prev.l, bot=nxt.h, kind="bear", idx=i))
 
@@ -219,14 +225,13 @@ def find_fvgs(candles: list[Candle], lookback: int = 40) -> list[FVG]:
 
 def find_liquidity(swings: list[Swing]) -> tuple[list[float], list[float]]:
     """
-    Returns (bsl_levels, ssl_levels).
-    BSL: Buy-Side Liquidity — equal/swing highs targeted for stops above.
-    SSL: Sell-Side Liquidity — equal/swing lows targeted for stops below.
+    Retorna (bsl_levels, ssl_levels).
+    BSL: highs donde estan los stops de compradores.
+    SSL: lows donde estan los stops de vendedores.
     """
     highs = sorted([s.price for s in swings if s.kind == "high"])
     lows  = sorted([s.price for s in swings if s.kind == "low"])
 
-    # Group near-equal levels (within 0.15%)
     def cluster(levels: list[float], pct: float = 0.0015) -> list[float]:
         if not levels:
             return []
@@ -236,21 +241,19 @@ def find_liquidity(swings: list[Swing]) -> tuple[list[float], list[float]]:
                 result.append(lvl)
         return result
 
-    bsl = cluster(list(reversed(highs)))  # highest first
-    ssl = cluster(lows)                   # lowest first
-
+    bsl = cluster(list(reversed(highs)))
+    ssl = cluster(lows)
     return bsl, ssl
 
 
-# ── CHoCH detection on 15M ────────────────────────────────────────────────────
+# ── CHoCH en 15M ─────────────────────────────────────────────────────────────
 
 def detect_choch_15m(
     candles_15m: list[Candle], higher_tf_trend: str
 ) -> Optional[dict]:
     """
-    Detect a Change of Character on 15M that aligns with a potential reversal.
-    Returns dict with keys: kind ('bullish'/'bearish'), level, candle_idx
-    or None if no CHoCH found.
+    Detecta Change of Character en 15M alineado con el trend de mayor TF.
+    Retorna dict(kind, level, candle_idx) o None.
     """
     swings = find_swings(candles_15m, left=3, right=3)
     if not swings:
@@ -259,16 +262,10 @@ def detect_choch_15m(
     highs = [s for s in swings if s.kind == "high"]
     lows  = [s for s in swings if s.kind == "low"]
 
-    # Bearish CHoCH: price was making HH/HL, then broke below a HL
-    # Bullish CHoCH: price was making LL/LH, then broke above a LH
-    last_price = candles_15m[-1].c
-
     if higher_tf_trend == "bearish" and len(lows) >= 2:
-        # Look for price breaking below the most recent higher low
         recent_lows = sorted(lows, key=lambda s: s.idx)
         for i in range(len(recent_lows) - 1, 0, -1):
             if recent_lows[i].price < recent_lows[i - 1].price:
-                # Lower low formed — bearish CHoCH
                 return {
                     "kind": "bearish",
                     "level": recent_lows[i].price,
@@ -276,11 +273,9 @@ def detect_choch_15m(
                 }
 
     if higher_tf_trend == "bullish" and len(highs) >= 2:
-        # Look for price breaking above the most recent lower high
         recent_highs = sorted(highs, key=lambda s: s.idx)
         for i in range(len(recent_highs) - 1, 0, -1):
             if recent_highs[i].price > recent_highs[i - 1].price:
-                # Higher high formed — bullish CHoCH
                 return {
                     "kind": "bullish",
                     "level": recent_highs[i].price,
